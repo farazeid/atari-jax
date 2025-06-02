@@ -1,0 +1,32 @@
+[project]
+name = "atari-jax"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "chex>=0.1.89",
+    "dm-haiku>=0.0.14",
+    "gym>=0.26.2",
+    "jax>=0.6.1",
+    "optax>=0.2.4",
+    "rlax>=0.1.7",
+]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "N",   # pep8-naming
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "S",   # flake8-bandit
+    "UP",  # pyupgrade
+    "ANN",  # flake8-annotations
+    "SIM",  # flake8-simplify
+    "C90", # mccabe cyclomatic complexity
+]
