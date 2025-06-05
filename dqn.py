@@ -1,17 +1,19 @@
+import collections
 import logging
+import random
 import sys
 
 import ale_py
 import chex
+import flashbax as fbx
 import gymnasium
 import jax
 import jax.numpy as jnp
 import jax.random as jr
+import mlflow
 import optax
 from flax import nnx
 from gymnasium.wrappers import AtariPreprocessing, FrameStackObservation
-
-from buffers import ReplayBuffer, Transition
 
 logging.basicConfig(
     stream=sys.stdout,
@@ -19,6 +21,15 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+@chex.dataclass
+class Transition:
+    obs: jnp.ndarray
+    action: int
+    reward: float
+    next_obs: jnp.ndarray
+    done: bool
 
 
 class DQN(nnx.Module):
@@ -55,6 +66,7 @@ class DQN(nnx.Module):
         self.dense1 = nnx.Linear(in_features=7 * 7 * 64, out_features=512, rngs=rngs)
         self.dense2 = nnx.Linear(in_features=512, out_features=n_actions, rngs=rngs)
 
+    # @nnx.jit
     def __call__(self, obs: jnp.ndarray) -> jnp.ndarray:
         # obs shape: (batch_size, 84, 84, 4), dtype: uint8
         chex.assert_shape(obs, (None, 84, 84, 4))  # Allow for batch dimension
@@ -71,6 +83,7 @@ class DQN(nnx.Module):
         return x
 
 
+@nnx.jit
 def loss_fn(q_network: DQN, target_q_network: DQN, batch: Transition, gamma: float):
     q_pred_all_actions = q_network(batch.obs.transpose(0, 2, 3, 1))  # NHWC
     q_pred = jnp.take_along_axis(
@@ -89,7 +102,64 @@ def loss_fn(q_network: DQN, target_q_network: DQN, batch: Transition, gamma: flo
     return loss
 
 
+@nnx.jit
+def select_action(
+    q_network: DQN,
+    obs: jnp.ndarray,
+    key: jr.PRNGKey,
+    epsilon: float,
+    n_actions: int,
+    eval_mode: bool,
+) -> int:
+    """Selects an action using an epsilon-greedy policy."""
+    explore_key, random_action_key = jr.split(key)
+
+    def explore_fn():
+        return jr.randint(random_action_key, (), 0, n_actions)
+
+    def exploit_fn():
+        obs_batched = jnp.expand_dims(obs, 0)
+        # Transpose CHW to NHWC for the network
+        q_values = q_network(obs_batched.transpose(0, 2, 3, 1))
+        return jnp.argmax(q_values[0])
+
+    action = jax.lax.cond(
+        jnp.logical_and(jnp.logical_not(eval_mode), jr.uniform(explore_key) < epsilon),
+        explore_fn,
+        exploit_fn,
+    )
+    return action
+
+
+@nnx.jit
+def train_step(
+    opt: nnx.Optimizer,
+    target_q_network: DQN,
+    replay_buffer_state: fbx.buffers.flat_buffer.TrajectoryBufferState,
+    gamma: float,
+    sample_key: jr.PRNGKey,
+) -> tuple[float, nnx.Optimizer]:
+    experience_pair = replay_buffer.sample(replay_buffer_state, sample_key).experience
+    current_transition: Transition = experience_pair.first
+    q_network = opt.model
+    loss, grads = nnx.value_and_grad(loss_fn)(
+        q_network, target_q_network, current_transition, gamma
+    )
+    opt.update(grads)  # Updates q_network's params within opt
+    return loss, opt
+
+
+@nnx.jit
+def update_target_network(q_network: DQN, target_q_network: DQN) -> DQN:
+    q_params = nnx.state(q_network, nnx.Param)
+    nnx.update(target_q_network, q_params)
+    return target_q_network
+
+
 if __name__ == "__main__":
+    # jax.disable_jit()
+    mlflow.set_experiment("dqn")
+
     validate: bool = True
     eval_mode: bool = False
 
@@ -102,23 +172,25 @@ if __name__ == "__main__":
     seed: int = 42
     key = jr.PRNGKey(seed)
 
-    n_steps: int = 50_000  # _000
-    target_update_freq: int = 10  # _000
+    n_steps: int = 50_000_000
+    target_update_freq: int = 10_000
     batch_size: int = 32
     gamma: float = 0.99
     frame_skip: int = 4
 
-    replay_size: int = 1_000  # _000
-    replay_start_size: int = 50  # _000
+    replay_size: int = 1_000_000
+    replay_start_size: int = 5_000
 
     epsilon: float = 1.0
     epsilon_end: float = 0.1
-    epsilon_lifetime: int = 1_000  # _000
+    epsilon_lifetime: int = 1_000_000
     epsilon_decay: float = (epsilon_end - epsilon) / epsilon_lifetime
 
     lr: float = 0.00025
     momentum: float = 0.95
     opt_eps: float = 0.01
+
+    n_envs: int = 1
     # end: hyperparameters
 
     env_id = "ALE/Breakout-v5"
@@ -149,11 +221,27 @@ if __name__ == "__main__":
         optax.rmsprop(learning_rate=lr, momentum=momentum, eps=opt_eps, centered=True),
     )
 
-    replay_buffer = ReplayBuffer(
-        capacity=replay_size,
-        obs_shape=obs_shape,
-        obs_dtype=obs_dtype,
+    replay_buffer = fbx.make_flat_buffer(
+        max_length=replay_size,
+        min_length=replay_start_size,
+        sample_batch_size=batch_size,
+        add_sequences=False,  # Add individual transitions, not sequences
+        add_batch_size=n_envs if n_envs > 1 else None,
     )
+    replay_buffer = replay_buffer.replace(
+        init=jax.jit(replay_buffer.init),
+        add=jax.jit(replay_buffer.add, donate_argnums=0),
+        sample=jax.jit(replay_buffer.sample),
+        can_sample=jax.jit(replay_buffer.can_sample),
+    )
+    dummy_transition = Transition(
+        obs=jnp.zeros(obs_shape, dtype=obs_dtype),
+        action=0,
+        reward=0.0,
+        next_obs=jnp.zeros(obs_shape, dtype=obs_dtype),
+        done=False,
+    )
+    replay_buffer_state = replay_buffer.init(dummy_transition)
 
     obs, _ = env.reset(seed=seed)
     obs = jnp.array(obs)
@@ -162,13 +250,15 @@ if __name__ == "__main__":
     # Main loop of (1) Sampling and (2) Training
     for step in range(n_steps):
         # Sampling
-        key, decision_key = jr.split(key)
-        if not eval_mode and jr.uniform(decision_key) < epsilon:
-            action = jr.randint(decision_key, (), 0, n_actions).item()
-        else:
-            obs_batched = jnp.expand_dims(obs, 0)
-            q_values = q_network(obs_batched.transpose(0, 2, 3, 1))  # NHWC
-            action = jnp.argmax(q_values[0]).item()
+        key, action_sel_key = jr.split(key)
+        action = select_action(
+            opt.model,
+            obs,
+            action_sel_key,
+            epsilon,
+            n_actions,
+            eval_mode,
+        ).item()
 
         epsilon = max(epsilon_end, epsilon + epsilon_decay)
 
@@ -179,12 +269,15 @@ if __name__ == "__main__":
 
         done = terminated or truncated
 
-        replay_buffer.add(
-            obs,
-            action,
-            clipped_reward,
-            next_obs,
-            done,
+        replay_buffer_state = replay_buffer.add(
+            replay_buffer_state,
+            Transition(
+                obs=obs,
+                action=action,
+                reward=clipped_reward,
+                next_obs=next_obs,
+                done=done,
+            ),
         )
 
         obs = next_obs
@@ -195,23 +288,25 @@ if __name__ == "__main__":
             obs, _ = env.reset()
             obs = jnp.array(obs)
 
-            logger.info(f"Episode finished at step {step}: return={episode_return:.4f}")
+            # logger.info(f"Episode finished at step {step}: return={episode_return:.4f}")
+            mlflow.log_metric("episode_return", episode_return, step=step)
             episode_return = 0.0
 
         # Training
-        if step >= replay_start_size:
+        if replay_buffer.can_sample(replay_buffer_state):
             key, sample_key = jr.split(key)
-            batch: Transition = replay_buffer.sample(batch_size, sample_key)
-
-            loss, grads = nnx.value_and_grad(loss_fn)(
-                q_network, target_q_network, batch, gamma
+            loss, opt = train_step(
+                opt, target_q_network, replay_buffer_state, gamma, sample_key
             )
-            opt.update(grads)
 
             if step % target_update_freq == 0:
-                q_params = nnx.state(q_network, nnx.Param)
-                nnx.update(target_q_network, q_params)
-                logger.info(f"Step {step}: loss={loss:.4f}, epsilon={epsilon:.3f}")
+                target_q_network = update_target_network(q_network, target_q_network)
+                # logger.info(f"Step {step}: loss={loss:.4f}, epsilon={epsilon:.3f}")
+                mlflow.log_metric("loss", loss, step=step)
+                mlflow.log_metric("epsilon", epsilon, step=step)
+
+        if step % 1000 == 0:
+            logger.info(f"Step {step}")
 
     env.close()
     logger.info("Training finished")
