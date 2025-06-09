@@ -5,6 +5,16 @@ Install dependencies:
 uv sync  # explained below
 ```
 
+Run the code:
+```zsh
+uv run cartpole.py
+```
+
+Start `mlflow` server locally:
+```zsh
+mlflow server
+```
+
 
 # Tools
 
