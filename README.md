@@ -85,12 +85,12 @@ For example:
 def fn(x: int) -> str:
     ...
 
-a = fn()
+a = fn(0)
 ```
 is rendered as, with the added type hint greyed-out:
 ```python
 def fn(x: int) -> str:
     ...
 
-a: str = fn()
+a: str = fn(0)
 ```
