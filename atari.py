@@ -29,7 +29,7 @@ class Transition:
     action: jax.Array
     reward: jax.Array
     next_obs: jax.Array
-    done: jax.Array
+    terminated: jax.Array
 
 
 class JaxWrapper(gymnasium.Env):
@@ -148,7 +148,7 @@ def train_step(
         q_value = jax.vmap(lambda q, a: q[a])(q_value, batch.action)  # (batch_size,)
 
         target_next = target_network(batch.next_obs).max(axis=-1)  # (batch_size,)
-        target_value = batch.reward + (1 - batch.done) * gamma * target_next
+        target_value = batch.reward + (1 - batch.terminated) * gamma * target_next
 
         return optax.l2_loss(q_value, target_value).mean()
 
@@ -209,7 +209,8 @@ if __name__ == "__main__":
         return thunk
 
     envs = gymnasium.vector.SyncVectorEnv(
-        [make_env(env_id, seed + i) for i in range(n_envs)]
+        [make_env(env_id, seed + i) for i in range(n_envs)],
+        autoreset_mode=gymnasium.vector.AutoresetMode.SAME_STEP,
     )
     envs = JaxWrapper(envs)
     obs_shape = envs.single_observation_space.shape
@@ -260,7 +261,7 @@ if __name__ == "__main__":
         action=jnp.zeros((), dtype=jnp.int32),
         reward=jnp.zeros((), dtype=jnp.float32),
         next_obs=jnp.zeros(obs_shape, dtype=obs_dtype),
-        done=jnp.zeros((), dtype=bool),
+        terminated=jnp.zeros((), dtype=bool),
     )
 
     buffer_state = buffer.init(dummy_transition)
@@ -281,14 +282,18 @@ if __name__ == "__main__":
             epsilon - epsilon_decay_rate,
         )
 
-        next_obs, reward, terminate, truncation, info = envs.step(actions)
-        done = jnp.logical_or(terminate, truncation)
+        next_obs, reward, terminated, truncated, info = envs.step(actions)
 
-        if done:
+        if "final_info" in info:
             # fmt: off
-            mlflow.log_metric("charts/episodic_return", info["episode"]["r"], step)
-            mlflow.log_metric("charts/episodic_length", info["episode"]["l"], step)
+            mlflow.log_metric("charts/episodic_return", info["final_info"]["episode"]["r"], step)
+            mlflow.log_metric("charts/episodic_length", info["final_info"]["episode"]["l"], step)
             # fmt: on
+
+        real_next_obs = next_obs.copy()
+        for idx, trunc in enumerate(truncated):
+            if trunc:
+                real_next_obs.at[idx].set(info["final_obs"][idx])
 
         buffer_state = buffer.add(
             buffer_state,
@@ -296,8 +301,8 @@ if __name__ == "__main__":
                 obs=obs,
                 action=actions,
                 reward=reward,
-                next_obs=next_obs,
-                done=done,
+                next_obs=real_next_obs,
+                terminated=terminated,
             ),
         )
 
