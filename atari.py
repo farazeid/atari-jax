@@ -16,10 +16,7 @@ from gymnasium.wrappers import (
 )
 from stable_baselines3.common.atari_wrappers import (
     ClipRewardEnv,
-    EpisodicLifeEnv,
     FireResetEnv,
-    MaxAndSkipEnv,
-    NoopResetEnv,
 )
 
 
@@ -150,7 +147,7 @@ def train_step(
         target_next = target_network(batch.next_obs).max(axis=-1)  # (batch_size,)
         target_value = batch.reward + (1 - batch.terminated) * gamma * target_next
 
-        return optax.l2_loss(q_value, target_value).mean()
+        return optax.huber_loss(q_value, target_value).mean()
 
     loss, grads = nnx.value_and_grad(loss_fn)(opt.model)
     opt.update(grads=grads)
@@ -171,20 +168,29 @@ if __name__ == "__main__":
     key = jax.random.PRNGKey(seed)
 
     env_id: str = "BreakoutNoFrameskip-v4"
-    total_timesteps: int = 10_000_000
-    learning_rate: float = 1e-4
     n_envs: int = 1
-    buffer_size: int = 1_000_000
-    gamma: float = 0.99
-    tau: float = 1.0
-    target_network_frequency: int = 1_000
-    batch_size: int = 32
-    epsilon: float = 1
-    epsilon_end: float = 0.01
-    epsilon_lifetime: int = total_timesteps * 0.1
-    epsilon_decay_rate: float = (epsilon - epsilon_end) / epsilon_lifetime
-    learning_starts: int = 80_000
+    frame_skip: int = 4
+    noop_max: int = 30
+
+    total_timesteps: int = 50_000_000
+    learning_starts: int = 50_000
     train_frequency: int = 4
+    target_network_frequency: int = 10_000 * train_frequency
+
+    gamma: float = 0.99
+    learning_rate: float = 0.00025
+    momentum: float = 0.95
+    opt_decay: float = 0.95
+    opt_eps: float = 0.01
+
+    batch_size: int = 32
+    buffer_size: int = 1_000_000 // frame_skip
+    buffer_start_size: int = learning_starts // frame_skip
+
+    epsilon_start: float = 1
+    epsilon_end: float = 0.1
+    epsilon_lifetime: int = 1_000_000
+    epsilon = epsilon_start
 
     """
     Make environment
@@ -193,16 +199,18 @@ if __name__ == "__main__":
     def make_env(env_id: str, seed: int):
         def thunk():
             env = gymnasium.make(env_id)
-            env = NoopResetEnv(env, noop_max=30)
-            env = MaxAndSkipEnv(env, skip=4)
-            env = EpisodicLifeEnv(env)
-            if "FIRE" in env.unwrapped.get_action_meanings():
-                env = FireResetEnv(env)
+            env = AtariPreprocessing(
+                env,
+                noop_max=noop_max,  # NoopResetEnv
+                frame_skip=frame_skip,
+                screen_size=84,  # ResizeObservation
+                terminal_on_life_loss=True,  # EpisodicLifeEnv
+                grayscale_obs=True,  # GrayscaleObservation
+            )
+            env = FrameStackObservation(env, frame_skip)
+            env = FireResetEnv(env)
             env = ClipRewardEnv(env)
-            env = gymnasium.wrappers.ResizeObservation(env, (84, 84))
-            env = gymnasium.wrappers.GrayscaleObservation(env)
-            env = gymnasium.wrappers.FrameStackObservation(env, 4)
-            env = gymnasium.wrappers.RecordEpisodeStatistics(env)
+            env = RecordEpisodeStatistics(env)
             env.action_space.seed(seed)
             return env
 
@@ -235,7 +243,12 @@ if __name__ == "__main__":
 
     opt = nnx.Optimizer(
         q_network,
-        optax.adam(learning_rate=learning_rate),
+        optax.rmsprop(
+            learning_rate=learning_rate,
+            momentum=momentum,
+            decay=opt_decay,
+            eps=opt_eps,
+        ),
     )
 
     """
@@ -244,7 +257,7 @@ if __name__ == "__main__":
 
     buffer = fbx.make_flat_buffer(
         max_length=buffer_size,
-        min_length=buffer_size - 1,
+        min_length=buffer_start_size,
         sample_batch_size=batch_size,
         add_sequences=False,
         add_batch_size=n_envs,
@@ -273,13 +286,13 @@ if __name__ == "__main__":
     start_time = time.time()
 
     obs, _ = envs.reset(seed=seed)
-    for step in range(total_timesteps):
+    for step in range(0, total_timesteps, frame_skip):
         key, sample_key = jax.random.split(key, 2)
 
         actions = decide_action(key, q_network, obs, epsilon, n_actions)
         epsilon = max(
             epsilon_end,
-            epsilon - epsilon_decay_rate,
+            epsilon_start - (epsilon_start - epsilon_end) * step / epsilon_lifetime,
         )
 
         next_obs, reward, terminated, truncated, info = envs.step(actions)
