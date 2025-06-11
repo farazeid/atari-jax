@@ -287,9 +287,9 @@ if __name__ == "__main__":
 
     obs, _ = envs.reset(seed=seed)
     for step in range(0, total_timesteps, frame_skip):
-        key, sample_key = jax.random.split(key, 2)
+        key, decision_key, sample_key = jax.random.split(key, 2)
 
-        actions = decide_action(key, q_network, obs, epsilon, n_actions)
+        actions = decide_action(decision_key, q_network, obs, epsilon, n_actions)
         epsilon = max(
             epsilon_end,
             epsilon_start - (epsilon_start - epsilon_end) * step / epsilon_lifetime,
